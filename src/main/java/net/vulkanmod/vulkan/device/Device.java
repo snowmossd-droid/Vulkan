@@ -113,8 +113,12 @@ public class Device {
             var a = stack.mallocInt(1);
             vkEnumerateInstanceVersion(a);
             int vkVer1 = a.get(0);
+            if (VK_VERSION_MINOR(vkVer1) < 1) {
+                throw new RuntimeException("Vulkan 1.1 not supported: Only Has: %s".formatted(decDefVersion(vkVer1)));
+            }
+            // Warn if below 1.2 (some features may be limited on Vulkan 1.1 devices)
             if (VK_VERSION_MINOR(vkVer1) < 2) {
-                throw new RuntimeException("Vulkan 1.2 not supported: Only Has: %s".formatted(decDefVersion(vkVer1)));
+                System.err.println("[VulkanMod] Warning: Vulkan 1.2 not available, running on " + decDefVersion(vkVer1) + " (Android workaround)");
             }
             return vkVer1;
         }
@@ -159,4 +163,5 @@ public class Device {
     public boolean isIntel() {
         return vendorId == 0x8086;
     }
-}
+        }
+                

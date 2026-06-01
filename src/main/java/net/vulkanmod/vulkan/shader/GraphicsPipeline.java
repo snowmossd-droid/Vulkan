@@ -9,6 +9,7 @@ import net.vulkanmod.interfaces.VertexFormatMixed;
 import net.vulkanmod.vulkan.Renderer;
 import net.vulkanmod.vulkan.Vulkan;
 import net.vulkanmod.vulkan.device.DeviceManager;
+import net.vulkanmod.vulkan.framebuffer.Framebuffer;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
 import org.lwjgl.vulkan.*;
@@ -30,9 +31,8 @@ public class GraphicsPipeline extends Pipeline {
     private long fragShaderModule = 0;
 
     GraphicsPipeline(Builder builder) {
-        super(builder.shaderPath);
+        super(builder.name);
         this.buffers = builder.UBOs;
-        this.manualUBO = builder.manualUBO;
         this.imageDescriptors = builder.imageDescriptors;
         this.pushConstants = builder.pushConstants;
         this.vertexFormat = builder.vertexFormat;
@@ -41,7 +41,8 @@ public class GraphicsPipeline extends Pipeline {
 
         createDescriptorSetLayout();
         createPipelineLayout();
-        createShaderModules(builder.vertShaderSPIRV, builder.fragShaderSPIRV);
+
+        createShaderModules(builder);
 
         if (builder.renderPass != null)
             graphicsPipelines.computeIfAbsent(PipelineState.DEFAULT,
@@ -53,7 +54,12 @@ public class GraphicsPipeline extends Pipeline {
     }
 
     public long getHandle(PipelineState state) {
-        return graphicsPipelines.computeIfAbsent(state, this::createGraphicsPipeline);
+        long handle = graphicsPipelines.computeIfAbsent(state, this::createGraphicsPipeline);
+        // If pipeline creation was deferred (null renderpass), evict so we retry next frame
+        if (handle == VK_NULL_HANDLE) {
+            graphicsPipelines.removeLong(state);
+        }
+        return handle;
     }
 
     private long createGraphicsPipeline(PipelineState state) {
@@ -193,15 +199,35 @@ public class GraphicsPipeline extends Pipeline {
             pipelineInfo.basePipelineIndex(-1);
 
             if (!Vulkan.DYNAMIC_RENDERING) {
-                pipelineInfo.renderPass(state.renderPass.getId());
+                // When renderPass is null (e.g. DEFAULT PipelineState), fall back to the currently
+                // bound renderpass. This mirrors the dynamic-rendering fallback to mainFramebuffer.
+                net.vulkanmod.vulkan.framebuffer.RenderPass resolvedRenderPass = state.renderPass;
+                if (resolvedRenderPass == null) {
+                    resolvedRenderPass = Renderer.getInstance().getBoundRenderPass();
+                }
+                if (resolvedRenderPass == null) {
+                    // Last resort: skip pipeline creation for now — will retry next draw call
+                    net.vulkanmod.Initializer.LOGGER.warn(
+                        "GraphicsPipeline: renderPass is null in non-dynamic mode, deferring pipeline creation.");
+                    return VK_NULL_HANDLE;
+                }
+                pipelineInfo.renderPass(resolvedRenderPass.getId());
                 pipelineInfo.subpass(0);
             }
             else {
                 //dyn-rendering
                 VkPipelineRenderingCreateInfoKHR renderingInfo = VkPipelineRenderingCreateInfoKHR.calloc(stack);
                 renderingInfo.sType(KHRDynamicRendering.VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR);
-                renderingInfo.pColorAttachmentFormats(stack.ints(state.renderPass.getFramebuffer().getFormat()));
-                renderingInfo.depthAttachmentFormat(state.renderPass.getFramebuffer().getDepthFormat());
+
+                Framebuffer framebuffer;
+                if (state.renderPass != null) {
+                    framebuffer = state.renderPass.getFramebuffer();
+                } else {
+                    framebuffer = Renderer.getInstance().getMainPass().getMainFramebuffer();
+                }
+
+                renderingInfo.pColorAttachmentFormats(stack.ints(framebuffer.getFormat()));
+                renderingInfo.depthAttachmentFormat(framebuffer.getDepthFormat());
                 pipelineInfo.pNext(renderingInfo);
             }
 
@@ -214,9 +240,15 @@ public class GraphicsPipeline extends Pipeline {
         }
     }
 
-    private void createShaderModules(SPIRVUtils.SPIRV vertSpirv, SPIRVUtils.SPIRV fragSpirv) {
-        this.vertShaderModule = createShaderModule(vertSpirv.bytecode());
-        this.fragShaderModule = createShaderModule(fragSpirv.bytecode());
+    private void createShaderModules(Builder builder) {
+        String vsh = builder.shadersSrc.get(SPIRVUtils.ShaderKind.VERTEX_SHADER);
+        SPIRVUtils.SPIRV vertShaderSPIRV = SPIRVUtils.compileShader(String.format("%s.vsh", name), vsh, SPIRVUtils.ShaderKind.VERTEX_SHADER);
+
+        String fsh = builder.shadersSrc.get(SPIRVUtils.ShaderKind.FRAGMENT_SHADER);
+        SPIRVUtils.SPIRV fragShaderSPIRV = SPIRVUtils.compileShader(String.format("%s.vsh", name), fsh, SPIRVUtils.ShaderKind.FRAGMENT_SHADER);
+
+        this.vertShaderModule = createShaderModule(vertShaderSPIRV.bytecode());
+        this.fragShaderModule = createShaderModule(fragShaderSPIRV.bytecode());
     }
 
     public void cleanUp() {
@@ -382,8 +414,14 @@ public class GraphicsPipeline extends Pipeline {
 
                         offset += 4;
                     }
+                    else if (type == VertexFormatElement.Type.FLOAT && elementCount == 1) {
+                        posDescription.format(VK_FORMAT_R32_SFLOAT);
+                        posDescription.offset(offset);
+
+                        offset += 4;
+                    }
                     else {
-                        throw new RuntimeException(String.format("Unknown format: %s", usage));
+                        throw new RuntimeException(String.format("Unknown type: %s", type));
                     }
                 }
 
@@ -395,4 +433,5 @@ public class GraphicsPipeline extends Pipeline {
 
         return attributeDescriptions.rewind();
     }
-}
+            }
+    

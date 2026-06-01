@@ -3,10 +3,10 @@ package net.vulkanmod.vulkan;
 import net.vulkanmod.vulkan.device.Device;
 import net.vulkanmod.vulkan.device.DeviceManager;
 import net.vulkanmod.vulkan.framebuffer.SwapChain;
-import net.vulkanmod.vulkan.memory.buffer.Buffer;
 import net.vulkanmod.vulkan.memory.MemoryManager;
 import net.vulkanmod.vulkan.memory.MemoryTypes;
 import net.vulkanmod.vulkan.memory.buffer.StagingBuffer;
+import net.vulkanmod.vulkan.memory.buffer.StagingBuffers;
 import net.vulkanmod.vulkan.queue.Queue;
 import net.vulkanmod.vulkan.shader.Pipeline;
 import net.vulkanmod.vulkan.texture.SamplerManager;
@@ -19,7 +19,10 @@ import org.lwjgl.vulkan.*;
 
 import java.nio.IntBuffer;
 import java.nio.LongBuffer;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
 
 import static java.util.stream.Collectors.toSet;
 import static net.vulkanmod.vulkan.queue.Queue.getQueueFamilies;
@@ -38,10 +41,11 @@ import static org.lwjgl.vulkan.VK11.VK_API_VERSION_1_1;
 
 public class Vulkan {
 
-    public static final boolean ENABLE_VALIDATION_LAYERS = false;
+        public static final boolean ENABLE_VALIDATION_LAYERS = false;
 //    public static final boolean ENABLE_VALIDATION_LAYERS = true;
 
-    public static final boolean DYNAMIC_RENDERING = false;
+    // Set to false initially; will be enabled at runtime only if the device supports VK_KHR_dynamic_rendering
+    public static boolean DYNAMIC_RENDERING = false;
 
     public static final Set<String> VALIDATION_LAYERS;
 
@@ -57,16 +61,29 @@ public class Vulkan {
         }
     }
 
-    public static final Set<String> REQUIRED_EXTENSION = getRequiredExtensionSet();
+    // Mutable so initDynamicRendering() can add VK_KHR_dynamic_rendering if the device supports it
+    public static Set<String> REQUIRED_EXTENSION = getRequiredExtensionSet();
 
     private static Set<String> getRequiredExtensionSet() {
-        ArrayList<String> extensions = new ArrayList<>(List.of(VK_KHR_SWAPCHAIN_EXTENSION_NAME));
+        // Only require swapchain by default; dynamic rendering is optional and checked at runtime
+        return new HashSet<>(List.of(VK_KHR_SWAPCHAIN_EXTENSION_NAME));
+    }
 
-        if (DYNAMIC_RENDERING) {
-            extensions.add(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
+    /**
+     * Called by DeviceManager after a physical device is selected.
+     * Enables dynamic rendering only if the chosen GPU supports VK_KHR_dynamic_rendering.
+     */
+    public static void initDynamicRendering(Set<String> availableExtensionNames) {
+        if (availableExtensionNames.contains(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME)) {
+            DYNAMIC_RENDERING = true;
+            REQUIRED_EXTENSION.add(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
+            net.vulkanmod.Initializer.LOGGER.info("VK_KHR_dynamic_rendering supported -- enabling dynamic rendering.");
+        } else {
+            DYNAMIC_RENDERING = false;
+            net.vulkanmod.Initializer.LOGGER.warn(
+                "VK_KHR_dynamic_rendering NOT supported by this GPU. " +
+                "Running without dynamic rendering (Android/PowerVR fallback).");
         }
-
-        return new HashSet<>(extensions);
     }
 
     private static int debugCallback(int messageSeverity, int messageType, long pCallbackData, long pUserData) {
@@ -92,7 +109,8 @@ public class Vulkan {
     }
 
     private static int createDebugUtilsMessengerEXT(VkInstance instance, VkDebugUtilsMessengerCreateInfoEXT createInfo,
-                                                    VkAllocationCallbacks allocationCallbacks, LongBuffer pDebugMessenger) {
+                                                    VkAllocationCallbacks allocationCallbacks,
+                                                    LongBuffer pDebugMessenger) {
 
         if (vkGetInstanceProcAddr(instance, "vkCreateDebugUtilsMessengerEXT") != NULL) {
             return vkCreateDebugUtilsMessengerEXT(instance, createInfo, allocationCallbacks, pDebugMessenger);
@@ -101,7 +119,8 @@ public class Vulkan {
         return VK_ERROR_EXTENSION_NOT_PRESENT;
     }
 
-    private static void destroyDebugUtilsMessengerEXT(VkInstance instance, long debugMessenger, VkAllocationCallbacks allocationCallbacks) {
+    private static void destroyDebugUtilsMessengerEXT(VkInstance instance, long debugMessenger,
+                                                      VkAllocationCallbacks allocationCallbacks) {
 
         if (vkGetInstanceProcAddr(instance, "vkDestroyDebugUtilsMessengerEXT") != NULL) {
             vkDestroyDebugUtilsMessengerEXT(instance, debugMessenger, allocationCallbacks);
@@ -129,7 +148,7 @@ public class Vulkan {
 
     private static long allocator;
 
-    private static StagingBuffer[] stagingBuffers;
+    private static final StagingBuffers stagingBuffers = new StagingBuffers();
 
     public static boolean use24BitsDepthFormat = true;
     private static int DEFAULT_DEPTH_FORMAT = 0;
@@ -150,15 +169,7 @@ public class Vulkan {
     }
 
     static void createStagingBuffers() {
-        if (stagingBuffers != null) {
-            freeStagingBuffers();
-        }
-
-        stagingBuffers = new StagingBuffer[Renderer.getFramesNum()];
-
-        for (int i = 0; i < stagingBuffers.length; ++i) {
-            stagingBuffers[i] = new StagingBuffer();
-        }
+        stagingBuffers.updateFrameCount(Renderer.getFramesNum());
     }
 
     static void setupDepthFormat() {
@@ -196,7 +207,7 @@ public class Vulkan {
     }
 
     private static void freeStagingBuffers() {
-        Arrays.stream(stagingBuffers).forEach(Buffer::scheduleFree);
+        stagingBuffers.free();
     }
 
     private static void createInstance() {
@@ -256,8 +267,8 @@ public class Vulkan {
             vkEnumerateInstanceLayerProperties(layerCount, availableLayers);
 
             Set<String> availableLayerNames = availableLayers.stream()
-                    .map(VkLayerProperties::layerNameString)
-                    .collect(toSet());
+                                                             .map(VkLayerProperties::layerNameString)
+                                                             .collect(toSet());
 
             return availableLayerNames.containsAll(Vulkan.VALIDATION_LAYERS);
         }
@@ -287,7 +298,7 @@ public class Vulkan {
             LongBuffer pDebugMessenger = stack.longs(VK_NULL_HANDLE);
 
             checkResult(createDebugUtilsMessengerEXT(instance, createInfo, null, pDebugMessenger),
-                    "Failed to set up debug messenger");
+                        "Failed to set up debug messenger");
 
             debugMessenger = pDebugMessenger.get(0);
         }
@@ -312,7 +323,7 @@ public class Vulkan {
             LongBuffer pSurface = stack.longs(VK_NULL_HANDLE);
 
             checkResult(glfwCreateWindowSurface(instance, window, null, pSurface),
-                    "Failed to create window surface");
+                        "Failed to create window surface");
 
             surface = pSurface.get(0);
         }
@@ -334,7 +345,7 @@ public class Vulkan {
             PointerBuffer pAllocator = stack.pointers(VK_NULL_HANDLE);
 
             checkResult(vmaCreateAllocator(allocatorCreateInfo, pAllocator),
-                    "Failed to create Allocator");
+                        "Failed to create Allocator");
 
             allocator = pAllocator.get(0);
         }
@@ -354,7 +365,7 @@ public class Vulkan {
             LongBuffer pCommandPool = stack.mallocLong(1);
 
             checkResult(vkCreateCommandPool(DeviceManager.vkDevice, poolInfo, null, pCommandPool),
-                    "Failed to create command pool");
+                        "Failed to create command pool");
 
             commandPool = pCommandPool.get(0);
         }
@@ -364,9 +375,21 @@ public class Vulkan {
 
         PointerBuffer glfwExtensions = glfwGetRequiredInstanceExtensions();
 
-        if (ENABLE_VALIDATION_LAYERS) {
+        MemoryStack stack = stackGet();
 
-            MemoryStack stack = stackGet();
+        // Android/Pojav: GLFW trả về null, tự thêm extension cần thiết
+        if (glfwExtensions == null) {
+            java.util.List<String> androidExts = new java.util.ArrayList<>(java.util.List.of(
+                    "VK_KHR_surface",
+                    "VK_KHR_android_surface"
+            ));
+            if (ENABLE_VALIDATION_LAYERS) androidExts.add(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+            PointerBuffer extensions = stack.mallocPointer(androidExts.size());
+            for (String ext : androidExts) extensions.put(stack.UTF8(ext));
+            return extensions.rewind();
+        }
+
+        if (ENABLE_VALIDATION_LAYERS) {
 
             PointerBuffer extensions = stack.mallocPointer(glfwExtensions.capacity() + 1);
 
@@ -407,7 +430,11 @@ public class Vulkan {
     }
 
     public static StagingBuffer getStagingBuffer() {
-        return stagingBuffers[Renderer.getCurrentFrame()];
+        return stagingBuffers.getStagingBuffer();
+    }
+
+    public static StagingBuffers getStagingBuffers() {
+        return stagingBuffers;
     }
 
     public static Device getDevice() {
@@ -415,4 +442,4 @@ public class Vulkan {
     }
 }
 
-    
+            

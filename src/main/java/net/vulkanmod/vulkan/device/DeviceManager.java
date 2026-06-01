@@ -12,8 +12,8 @@ import org.lwjgl.vulkan.*;
 import java.nio.IntBuffer;
 import java.util.ArrayList;
 import java.util.HashSet;
-import java.util.List;
 import java.util.Set;
+import java.util.List;
 
 import static java.util.stream.Collectors.toSet;
 import static net.vulkanmod.vulkan.queue.Queue.findQueueFamilies;
@@ -49,10 +49,21 @@ public abstract class DeviceManager {
         try {
             DeviceManager.getSuitableDevices(instance);
             DeviceManager.pickPhysicalDevice();
+            // Detect VK_KHR_dynamic_rendering support on the chosen device BEFORE creating
+            // the logical device, so REQUIRED_EXTENSION is finalised correctly.
+            Vulkan.initDynamicRendering(getAvailableExtensionNames(physicalDevice));
             DeviceManager.createLogicalDevice();
         } catch (Exception e) {
             Initializer.LOGGER.info(getAvailableDevicesInfo());
             throw new RuntimeException(e);
+        }
+    }
+
+    private static java.util.Set<String> getAvailableExtensionNames(VkPhysicalDevice device) {
+        try (MemoryStack stack = stackPush()) {
+            return getAvailableExtension(stack, device).stream()
+                    .map(VkExtensionProperties::extensionNameString)
+                    .collect(java.util.stream.Collectors.toSet());
         }
     }
 
@@ -121,15 +132,13 @@ public abstract class DeviceManager {
     }
 
     static Device autoPickDevice() {
-        // Android fallback: if no suitable devices found by strict criteria, try all available devices
+        // Android fallback: nếu không có suitable device thì dùng available devices
         List<Device> candidateList = suitableDevices.isEmpty() ? availableDevices : suitableDevices;
-
         if (candidateList.isEmpty()) {
             throw new IllegalStateException("Failed to find a suitable GPU");
         }
-
         if (suitableDevices.isEmpty()) {
-            Initializer.LOGGER.warn("No suitable devices found by strict criteria. Falling back to available devices (Android workaround).");
+            Initializer.LOGGER.warn("No suitable devices found, falling back to available devices (Android workaround).");
         }
 
         ArrayList<Device> integratedGPUs = new ArrayList<>();
@@ -226,8 +235,6 @@ public abstract class DeviceManager {
 
 //            Configuration.DEBUG_FUNCTIONS.set(true);
 
-            createInfo.ppEnabledLayerNames(Vulkan.ENABLE_VALIDATION_LAYERS ? asPointerBuffer(Vulkan.VALIDATION_LAYERS) : null);
-
             PointerBuffer pDevice = stack.pointers(VK_NULL_HANDLE);
 
             int res = vkCreateDevice(physicalDevice, createInfo, null, pDevice);
@@ -270,10 +277,6 @@ public abstract class DeviceManager {
                     .map(VkExtensionProperties::extensionNameString)
                     .collect(toSet());
 
-            // On Android (Pojav/Zalith), VK_KHR_swapchain may be reported under a different
-            // name or the surface may not be ready yet during device enumeration.
-            // We relax the swapchain extension check: if VK_KHR_swapchain is missing but the
-            // device is otherwise capable (correct queue families, Vulkan 1.1+), still accept it.
             boolean extensionsSupported = availableExtensionNames.containsAll(Vulkan.REQUIRED_EXTENSION);
 
             boolean swapChainAdequate;
@@ -284,16 +287,13 @@ public abstract class DeviceManager {
                     swapChainAdequate = surfaceProperties.formats != null && surfaceProperties.formats.hasRemaining()
                             && surfaceProperties.presentModes != null && surfaceProperties.presentModes.hasRemaining();
                 } catch (Exception e) {
-                    // Surface may not be fully set up on Android yet; assume adequate and continue
-                    Initializer.LOGGER.warn("Surface query failed for device, assuming swapchain adequate: " + e.getMessage());
+                    Initializer.LOGGER.warn("Surface query failed, assuming swapchain adequate (Android workaround): " + e.getMessage());
                     swapChainAdequate = true;
                 }
             } else {
-                // If swapchain extension appears missing, check if it's just not reported correctly
-                // (common on some Android Vulkan drivers). Accept if queues are suitable.
-                boolean swapchainMissing = !availableExtensionNames.contains("VK_KHR_swapchain");
-                if (swapchainMissing && indices.isSuitable()) {
-                    Initializer.LOGGER.warn("VK_KHR_swapchain not found in extension list but device has suitable queues. Attempting to use device anyway (Android workaround).");
+                // Android: VK_KHR_swapchain có thể không được report đúng
+                if (!availableExtensionNames.contains("VK_KHR_swapchain") && indices.isSuitable()) {
+                    Initializer.LOGGER.warn("VK_KHR_swapchain missing but queues are suitable, attempting anyway (Android workaround).");
                     return true;
                 }
                 swapChainAdequate = false;
@@ -434,5 +434,5 @@ public abstract class DeviceManager {
         public IntBuffer presentModes;
     }
 
-                    }
-                
+    }
+                                                 
